@@ -7,11 +7,14 @@ import { getProductById, getProducts, getReviewsByProduct } from '../lib/data';
 import {
   getAdminOrders,
   getAvailableDeliveries,
+  getCashierTodayOrders,
+  getFailedPaymentOrders,
   getOrderById,
   getOrderStatusHistory,
   getOrderTrackingPoints,
   getOrdersForUser,
   getPendingPaymentOrders,
+  getRefundableOrders,
 } from '../lib/orders';
 import { queryKeys } from '../lib/queryClient';
 import type { Order, Product, Role } from '../lib/types';
@@ -108,6 +111,31 @@ export function usePendingPaymentsQuery() {
   return useQuery({
     queryKey: queryKeys.pendingPayments,
     queryFn: getPendingPaymentOrders,
+    staleTime: 15 * 1000,
+  });
+}
+
+export function useFailedPaymentsQuery() {
+  return useQuery({
+    queryKey: queryKeys.failedPayments,
+    queryFn: getFailedPaymentOrders,
+    staleTime: 15 * 1000,
+  });
+}
+
+export function useCashierTodayOrdersQuery(cashierId?: string) {
+  return useQuery({
+    queryKey: queryKeys.cashierTodayOrders(cashierId ?? ''),
+    enabled: Boolean(cashierId),
+    queryFn: () => getCashierTodayOrders(cashierId!),
+    staleTime: 10 * 1000,
+  });
+}
+
+export function useRefundableOrdersQuery() {
+  return useQuery({
+    queryKey: queryKeys.refundableOrders,
+    queryFn: getRefundableOrders,
     staleTime: 15 * 1000,
   });
 }

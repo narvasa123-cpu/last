@@ -376,7 +376,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
       updateDemoRole,
       demoCredentials,
     }),
-    [loading, profile, role, user],
+    [loading, profile, role, user, signIn, signUp, signOut, refreshProfile, saveProfile, updateDemoRole],
   );
 
   return createElement(AuthContext.Provider, { value }, children);

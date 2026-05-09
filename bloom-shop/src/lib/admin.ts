@@ -3,6 +3,7 @@ import {
   LOW_STOCK_PRODUCTS,
   MOCK_COUPONS,
   MOCK_PRODUCTS,
+  MOCK_REVIEWS,
   MOCK_USERS,
   ROLE_ID_TO_NAME,
   ROLE_NAME_TO_ID,
@@ -11,7 +12,22 @@ import {
 } from './constants';
 import { getAdminOrders } from './orders';
 import { isSupabaseConfigured, supabase, withFallback } from './supabase';
-import type { Coupon, DashboardMetric, Order, Product, ProductCategory, Role, UserProfile } from './types';
+import type {
+  ActivityLog,
+  AdminListParams,
+  Coupon,
+  DashboardMetric,
+  Order,
+  OrderItem,
+  PaginatedResult,
+  Product,
+  ProductCategory,
+  Review,
+  Role,
+  StockChangeLog,
+  Tier,
+  UserProfile,
+} from './types';
 import { formatPrice, getTier } from './utils';
 
 type AdminAnalyticsRange = '7d' | '30d' | '90d';
@@ -50,10 +66,15 @@ interface AdminAnalytics {
 let demoUsers = clone(MOCK_USERS);
 let demoCoupons = clone(MOCK_COUPONS);
 let demoProducts = clone(MOCK_PRODUCTS);
+let demoReviews = clone(MOCK_REVIEWS).map((review) => ({ ...review, is_hidden: false }));
+let demoStockHistory: StockChangeLog[] = [];
+let demoActivityLogs: ActivityLog[] = [];
 
 export const PRODUCT_IMAGE_BUCKET = 'product-images';
+export const AVATAR_IMAGE_BUCKET = 'avatars';
 
 const MAX_PRODUCT_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_AVATAR_IMAGE_BYTES = 2 * 1024 * 1024;
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -84,12 +105,57 @@ function normalizeProduct(product: Product): Product {
   };
 }
 
+function paginateLocal<T>(rows: T[], page = 1, pageSize = 10): PaginatedResult<T> {
+  const safePage = Math.max(1, page);
+  const safePageSize = Math.max(1, pageSize);
+  const offset = (safePage - 1) * safePageSize;
+
+  return {
+    data: rows.slice(offset, offset + safePageSize),
+    total: rows.length,
+    page: safePage,
+    pageSize: safePageSize,
+  };
+}
+
+function getRange(params: AdminListParams) {
+  const page = Math.max(1, params.page ?? 1);
+  const pageSize = Math.max(1, params.pageSize ?? 10);
+  const from = (page - 1) * pageSize;
+  const to = from + pageSize - 1;
+  return { page, pageSize, from, to };
+}
+
+async function writeActivity(action: string, details: Record<string, unknown>, userId?: string | null) {
+  const log: ActivityLog = {
+    id: crypto.randomUUID(),
+    user_id: userId ?? null,
+    action,
+    details,
+    created_at: new Date().toISOString(),
+  };
+
+  if (!isSupabaseConfigured) {
+    demoActivityLogs = [log, ...demoActivityLogs];
+    return;
+  }
+
+  await supabase.from('activity_logs').insert({
+    user_id: userId ?? null,
+    action,
+    details,
+  });
+}
+
 function getDayKey(date: Date): string {
-  return date.toISOString().slice(0, 10);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 function isSameDay(left: string | undefined, right: string): boolean {
-  return Boolean(left) && left?.slice(0, 10) === right;
+  return left ? getDayKey(new Date(left)) === right : false;
 }
 
 function sanitizeStorageSegment(value: string): string {
@@ -180,6 +246,47 @@ export async function uploadAdminProductImage(
   return { data: data.publicUrl, error: null };
 }
 
+export async function uploadAvatarImage(
+  file: File,
+  userId: string,
+): Promise<{ data: string | null; error: string | null }> {
+  if (!file.type.startsWith('image/')) {
+    return { data: null, error: 'Select a valid image file.' };
+  }
+
+  if (file.size > MAX_AVATAR_IMAGE_BYTES) {
+    return { data: null, error: 'Avatar images must be 2 MB or smaller.' };
+  }
+
+  if (!isSupabaseConfigured) {
+    try {
+      const previewUrl = await fileToDataUrl(file);
+      return { data: previewUrl, error: null };
+    } catch (error) {
+      return {
+        data: null,
+        error: error instanceof Error ? error.message : 'Unable to read the selected image.',
+      };
+    }
+  }
+
+  const extension = getImageExtension(file);
+  const assetPath = `avatars/${userId}-${Date.now()}-${crypto.randomUUID()}.${extension}`;
+
+  const { error: uploadError } = await supabase.storage.from(AVATAR_IMAGE_BUCKET).upload(assetPath, file, {
+    cacheControl: '3600',
+    upsert: false,
+    contentType: file.type,
+  });
+
+  if (uploadError) {
+    return { data: null, error: uploadError.message };
+  }
+
+  const { data } = supabase.storage.from(AVATAR_IMAGE_BUCKET).getPublicUrl(assetPath);
+  return { data: data.publicUrl, error: null };
+}
+
 export function subscribeToAdminTable(table: AdminRealtimeTable, onChange: () => void): () => void {
   if (!isSupabaseConfigured) {
     return () => undefined;
@@ -210,7 +317,7 @@ function buildRangeSeries(orders: Order[], days: number): number[] {
 
   for (const order of orders) {
     if (order.status === 'cancelled') continue;
-    const key = order.created_at.slice(0, 10);
+    const key = getDayKey(new Date(order.created_at));
     if (buckets.has(key)) {
       buckets.set(key, (buckets.get(key) ?? 0) + order.total_amount);
     }
@@ -226,7 +333,8 @@ function buildTopProductRevenue(orders: Order[]): Array<{ label: string; value: 
     if (order.status === 'cancelled') continue;
 
     for (const item of order.items ?? []) {
-      const label = item.product?.name ?? item.product_id;
+      const bouquet = getOrderItemBouquet(item);
+      const label = bouquet ? `${bouquet.sizeLabel} Custom Bouquet` : item.product?.name ?? item.product_id ?? 'Custom item';
       totals.set(label, (totals.get(label) ?? 0) + item.subtotal);
     }
   }
@@ -237,6 +345,29 @@ function buildTopProductRevenue(orders: Order[]): Array<{ label: string; value: 
     .slice(0, 5);
 }
 
+function getOrderItemBouquet(item: OrderItem) {
+  return item.custom_bouquet ?? item.product?.custom_bouquet ?? null;
+}
+
+function countCustomBouquetItems(orders: Order[]): number {
+  return orders.reduce(
+    (sum, order) => sum + (order.items ?? []).filter((item) => Boolean(getOrderItemBouquet(item))).length,
+    0,
+  );
+}
+
+function getCustomBouquetRevenue(orders: Order[]): number {
+  return orders.reduce(
+    (sum, order) =>
+      sum +
+      (order.items ?? []).reduce(
+        (orderSum, item) => orderSum + (getOrderItemBouquet(item) ? item.subtotal : 0),
+        0,
+      ),
+    0,
+  );
+}
+
 export async function getAdminUsers(): Promise<UserProfile[]> {
   const fallback = clone(demoUsers);
   const rows = await withFallback(
@@ -245,6 +376,57 @@ export async function getAdminUsers(): Promise<UserProfile[]> {
   );
 
   return (rows as UserRow[]).map(normalizeUser);
+}
+
+export async function getAdminUsersPage(
+  params: AdminListParams & { role?: Role | 'all'; tier?: Tier | 'all' } = {},
+): Promise<PaginatedResult<UserProfile>> {
+  const search = params.search?.trim().toLowerCase() ?? '';
+  const role = params.role ?? 'all';
+  const tier = params.tier ?? 'all';
+  const fallbackRows = clone(demoUsers)
+    .map(normalizeUser)
+    .filter((user) => role === 'all' || user.role === role)
+    .filter((user) => tier === 'all' || user.tier === tier)
+    .filter((user) => {
+      if (!search) return true;
+      return [user.full_name, user.phone, user.address, user.role, user.tier].some((value) =>
+        String(value ?? '').toLowerCase().includes(search),
+      );
+    });
+
+  if (!isSupabaseConfigured) {
+    return paginateLocal(fallbackRows, params.page, params.pageSize);
+  }
+
+  const { page, pageSize, from, to } = getRange(params);
+  let query = supabase
+    .from('users')
+    .select('*, roles(name)', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(from, to);
+
+  if (role !== 'all') {
+    query = query.eq('role_id', ROLE_NAME_TO_ID[role]);
+  }
+
+  if (tier !== 'all') {
+    query = query.eq('tier', tier);
+  }
+
+  if (search) {
+    query = query.or(`full_name.ilike.%${search}%,phone.ilike.%${search}%,address.ilike.%${search}%`);
+  }
+
+  const { data, count, error } = await query;
+  if (error || !data) return paginateLocal(fallbackRows, page, pageSize);
+
+  return {
+    data: (data as UserRow[]).map(normalizeUser),
+    total: count ?? 0,
+    page,
+    pageSize,
+  };
 }
 
 export async function updateAdminUser(
@@ -300,6 +482,44 @@ export async function getAdminCoupons(): Promise<Coupon[]> {
   );
 
   return (coupons as Coupon[]).map(normalizeCoupon);
+}
+
+export async function getAdminCouponsPage(
+  params: AdminListParams & { active?: 'all' | 'active' | 'inactive'; discountType?: 'all' | Coupon['discount_type'] } = {},
+): Promise<PaginatedResult<Coupon>> {
+  const search = params.search?.trim().toLowerCase() ?? '';
+  const active = params.active ?? 'all';
+  const discountType = params.discountType ?? 'all';
+  const fallbackRows = clone(demoCoupons)
+    .map(normalizeCoupon)
+    .filter((coupon) => active === 'all' || coupon.is_active === (active === 'active'))
+    .filter((coupon) => discountType === 'all' || coupon.discount_type === discountType)
+    .filter((coupon) => !search || coupon.code.toLowerCase().includes(search));
+
+  if (!isSupabaseConfigured) {
+    return paginateLocal(fallbackRows, params.page, params.pageSize);
+  }
+
+  const { page, pageSize, from, to } = getRange(params);
+  let query = supabase
+    .from('coupons')
+    .select('*', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(from, to);
+
+  if (active !== 'all') query = query.eq('is_active', active === 'active');
+  if (discountType !== 'all') query = query.eq('discount_type', discountType);
+  if (search) query = query.ilike('code', `%${search}%`);
+
+  const { data, count, error } = await query;
+  if (error || !data) return paginateLocal(fallbackRows, page, pageSize);
+
+  return {
+    data: (data as Coupon[]).map(normalizeCoupon),
+    total: count ?? 0,
+    page,
+    pageSize,
+  };
 }
 
 export async function updateAdminCoupon(
@@ -491,6 +711,57 @@ export async function getAdminProducts(): Promise<Product[]> {
   return (rows as Product[]).map(normalizeProduct);
 }
 
+export async function getAdminProductsPage(
+  params: AdminListParams & {
+    category?: ProductCategory | 'all';
+    featured?: 'all' | 'featured' | 'standard';
+    stock?: 'all' | 'low' | 'out';
+  } = {},
+): Promise<PaginatedResult<Product>> {
+  const search = params.search?.trim().toLowerCase() ?? '';
+  const category = params.category ?? 'all';
+  const featured = params.featured ?? 'all';
+  const stock = params.stock ?? 'all';
+  const fallbackRows = clone(demoProducts)
+    .map(normalizeProduct)
+    .filter((product) => category === 'all' || product.category === category)
+    .filter((product) => featured === 'all' || product.is_featured === (featured === 'featured'))
+    .filter((product) => stock === 'all' || (stock === 'low' ? product.stock > 0 && product.stock <= 12 : product.stock === 0))
+    .filter((product) => {
+      if (!search) return true;
+      return [product.name, product.category, product.description].some((value) =>
+        String(value ?? '').toLowerCase().includes(search),
+      );
+    });
+
+  if (!isSupabaseConfigured) {
+    return paginateLocal(fallbackRows, params.page, params.pageSize);
+  }
+
+  const { page, pageSize, from, to } = getRange(params);
+  let query = supabase
+    .from('products')
+    .select('*', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(from, to);
+
+  if (category !== 'all') query = query.eq('category', category);
+  if (featured !== 'all') query = query.eq('is_featured', featured === 'featured');
+  if (stock === 'low') query = query.gt('stock', 0).lte('stock', 12);
+  if (stock === 'out') query = query.eq('stock', 0);
+  if (search) query = query.or(`name.ilike.%${search}%,category.ilike.%${search}%,description.ilike.%${search}%`);
+
+  const { data, count, error } = await query;
+  if (error || !data) return paginateLocal(fallbackRows, page, pageSize);
+
+  return {
+    data: (data as Product[]).map(normalizeProduct),
+    total: count ?? 0,
+    page,
+    pageSize,
+  };
+}
+
 export async function createAdminProduct(
   payload: ProductPayload,
 ): Promise<{ data: Product | null; error: string | null }> {
@@ -582,6 +853,21 @@ export async function updateAdminProduct(
     });
 
     demoProducts = demoProducts.map((entry) => (entry.id === productId ? nextProduct : entry));
+    if (current.stock !== nextProduct.stock) {
+      demoStockHistory = [
+        {
+          id: crypto.randomUUID(),
+          product_id: productId,
+          previous_stock: current.stock,
+          next_stock: nextProduct.stock,
+          delta: nextProduct.stock - current.stock,
+          note: 'Product edit',
+          created_at: new Date().toISOString(),
+          product: { id: nextProduct.id, name: nextProduct.name },
+        },
+        ...demoStockHistory,
+      ];
+    }
     return { data: nextProduct, error: null };
   }
 
@@ -606,6 +892,226 @@ export async function updateAdminProduct(
   };
 }
 
+export async function updateProductFeatured(
+  productId: string,
+  isFeatured: boolean,
+): Promise<{ data: Product | null; error: string | null }> {
+  if (!isSupabaseConfigured) {
+    const current = demoProducts.find((entry) => entry.id === productId);
+    if (!current) return { data: null, error: 'Product not found.' };
+    const nextProduct = normalizeProduct({ ...current, is_featured: isFeatured, updated_at: new Date().toISOString() });
+    demoProducts = demoProducts.map((entry) => (entry.id === productId ? nextProduct : entry));
+    void writeActivity('product.featured_updated', { product_id: productId, is_featured: isFeatured });
+    return { data: nextProduct, error: null };
+  }
+
+  const { data, error } = await supabase
+    .from('products')
+    .update({ is_featured: isFeatured })
+    .eq('id', productId)
+    .select()
+    .maybeSingle();
+
+  if (data) void writeActivity('product.featured_updated', { product_id: productId, is_featured: isFeatured });
+
+  return {
+    data: data ? normalizeProduct(data as Product) : null,
+    error: error?.message ?? (data ? null : 'Unable to update the product.'),
+  };
+}
+
+export async function bulkAdjustProductStock(
+  productIds: string[],
+  delta: number,
+  note?: string,
+): Promise<{ data: Product[]; error: string | null }> {
+  if (!Number.isInteger(delta) || delta === 0) {
+    return { data: [], error: 'Enter a whole-number stock adjustment.' };
+  }
+
+  if (!productIds.length) {
+    return { data: [], error: 'Select at least one product.' };
+  }
+
+  const timestamp = new Date().toISOString();
+
+  if (!isSupabaseConfigured) {
+    const updated: Product[] = [];
+
+    demoProducts = demoProducts.map((product) => {
+      if (!productIds.includes(product.id)) return product;
+      const nextStock = Math.max(0, product.stock + delta);
+      const nextProduct = normalizeProduct({ ...product, stock: nextStock, updated_at: timestamp });
+      demoStockHistory = [
+        {
+          id: crypto.randomUUID(),
+          product_id: product.id,
+          previous_stock: product.stock,
+          next_stock: nextStock,
+          delta: nextStock - product.stock,
+          note: note ?? 'Bulk stock adjustment',
+          created_at: timestamp,
+          product: { id: product.id, name: product.name },
+        },
+        ...demoStockHistory,
+      ];
+      updated.push(nextProduct);
+      return nextProduct;
+    });
+    void writeActivity('product.stock_bulk_adjusted', { product_ids: productIds, delta, note });
+    return { data: updated, error: null };
+  }
+
+  const { data: currentRows, error: currentError } = await supabase
+    .from('products')
+    .select('*')
+    .in('id', productIds);
+
+  if (currentError || !currentRows) {
+    return { data: [], error: currentError?.message ?? 'Unable to load selected products.' };
+  }
+
+  const updated: Product[] = [];
+  for (const product of currentRows as Product[]) {
+    const nextStock = Math.max(0, product.stock + delta);
+    const { data, error } = await supabase
+      .from('products')
+      .update({ stock: nextStock })
+      .eq('id', product.id)
+      .select()
+      .maybeSingle();
+
+    if (error || !data) {
+      return { data: updated, error: error?.message ?? `Unable to update ${product.name}.` };
+    }
+
+    await supabase.from('stock_change_logs').insert({
+      product_id: product.id,
+      previous_stock: product.stock,
+      next_stock: nextStock,
+      delta: nextStock - product.stock,
+      note: note ?? 'Bulk stock adjustment',
+    });
+    updated.push(normalizeProduct(data as Product));
+  }
+
+  void writeActivity('product.stock_bulk_adjusted', { product_ids: productIds, delta, note });
+  return { data: updated, error: null };
+}
+
+export async function getStockChangeLogs(params: AdminListParams = {}): Promise<PaginatedResult<StockChangeLog>> {
+  const fallbackRows = clone(demoStockHistory);
+  if (!isSupabaseConfigured) return paginateLocal(fallbackRows, params.page, params.pageSize);
+
+  const { page, pageSize, from, to } = getRange(params);
+  const { data, count, error } = await supabase
+    .from('stock_change_logs')
+    .select('*, product:products(id, name)', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(from, to);
+
+  if (error || !data) return paginateLocal(fallbackRows, page, pageSize);
+  return { data: data as StockChangeLog[], total: count ?? 0, page, pageSize };
+}
+
+export async function updateAdminOrderNote(
+  orderId: string,
+  note: string,
+): Promise<{ data: Order | null; error: string | null }> {
+  if (!isSupabaseConfigured) {
+    return { data: null, error: 'Order notes are updated from the orders module in demo mode.' };
+  }
+
+  const { data, error } = await supabase
+    .from('orders')
+    .update({ admin_internal_note: note })
+    .eq('id', orderId)
+    .select()
+    .maybeSingle();
+
+  if (data) void writeActivity('order.internal_note_updated', { order_id: orderId });
+
+  return {
+    data: data as Order | null,
+    error: error?.message ?? (data ? null : 'Unable to save the internal note.'),
+  };
+}
+
+export async function getAdminReviewsPage(
+  params: AdminListParams & { rating?: 'all' | '1' | '2' | '3' | '4' | '5'; visibility?: 'all' | 'visible' | 'hidden' } = {},
+): Promise<PaginatedResult<Review>> {
+  const search = params.search?.trim().toLowerCase() ?? '';
+  const rating = params.rating ?? 'all';
+  const visibility = params.visibility ?? 'all';
+  const fallbackRows = clone(demoReviews)
+    .filter((review) => rating === 'all' || review.rating === Number(rating))
+    .filter((review) => visibility === 'all' || Boolean(review.is_hidden) === (visibility === 'hidden'))
+    .filter((review) => !search || review.comment.toLowerCase().includes(search));
+
+  if (!isSupabaseConfigured) return paginateLocal(fallbackRows, params.page, params.pageSize);
+
+  const { page, pageSize, from, to } = getRange(params);
+  let query = supabase
+    .from('reviews')
+    .select('*, user:users(full_name, avatar_url), product:products(id, name)', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(from, to);
+
+  if (rating !== 'all') query = query.eq('rating', Number(rating));
+  if (visibility !== 'all') query = query.eq('is_hidden', visibility === 'hidden');
+  if (search) query = query.ilike('comment', `%${search}%`);
+
+  const { data, count, error } = await query;
+  if (error || !data) return paginateLocal(fallbackRows, page, pageSize);
+  return { data: data as Review[], total: count ?? 0, page, pageSize };
+}
+
+export async function updateReviewVisibility(
+  reviewId: string,
+  isHidden: boolean,
+): Promise<{ data: Review | null; error: string | null }> {
+  if (!isSupabaseConfigured) {
+    const current = demoReviews.find((review) => review.id === reviewId);
+    if (!current) return { data: null, error: 'Review not found.' };
+    const nextReview = { ...current, is_hidden: isHidden };
+    demoReviews = demoReviews.map((review) => (review.id === reviewId ? nextReview : review));
+    void writeActivity('review.visibility_updated', { review_id: reviewId, is_hidden: isHidden });
+    return { data: nextReview, error: null };
+  }
+
+  const { data, error } = await supabase
+    .from('reviews')
+    .update({ is_hidden: isHidden })
+    .eq('id', reviewId)
+    .select('*, user:users(full_name, avatar_url), product:products(id, name)')
+    .maybeSingle();
+
+  if (data) void writeActivity('review.visibility_updated', { review_id: reviewId, is_hidden: isHidden });
+  return { data: data as Review | null, error: error?.message ?? (data ? null : 'Unable to update the review.') };
+}
+
+export async function getActivityLogsPage(params: AdminListParams = {}): Promise<PaginatedResult<ActivityLog>> {
+  const search = params.search?.trim().toLowerCase() ?? '';
+  const fallbackRows = clone(demoActivityLogs).filter(
+    (log) => !search || log.action.toLowerCase().includes(search) || JSON.stringify(log.details).toLowerCase().includes(search),
+  );
+
+  if (!isSupabaseConfigured) return paginateLocal(fallbackRows, params.page, params.pageSize);
+
+  const { page, pageSize, from, to } = getRange(params);
+  let query = supabase
+    .from('activity_logs')
+    .select('*, user:users(full_name)', { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(from, to);
+
+  if (search) query = query.or(`action.ilike.%${search}%`);
+
+  const { data, count, error } = await query;
+  if (error || !data) return paginateLocal(fallbackRows, page, pageSize);
+  return { data: data as ActivityLog[], total: count ?? 0, page, pageSize };
+}
+
 export async function deleteAdminProduct(productId: string): Promise<{ error: string | null }> {
   if (!isSupabaseConfigured) {
     demoProducts = demoProducts.filter((entry) => entry.id !== productId);
@@ -618,12 +1124,26 @@ export async function deleteAdminProduct(productId: string): Promise<{ error: st
 
 export async function getAdminAnalytics(): Promise<AdminAnalytics> {
   if (!isSupabaseConfigured) {
+    const orders = await getAdminOrders();
+    const activeOrders = orders.filter((order) => order.status !== 'cancelled');
+    const customBouquetCount = countCustomBouquetItems(activeOrders);
+
     return {
-      metrics: ADMIN_METRICS,
+      metrics: [
+        ...ADMIN_METRICS,
+        {
+          label: 'Custom Bouquets',
+          value: `${customBouquetCount}`,
+          trend: `${formatPrice(getCustomBouquetRevenue(activeOrders))} bespoke revenue`,
+          accent: customBouquetCount ? 'success' : 'neutral',
+        },
+      ],
       salesSeries: SALES_SERIES,
-      topProductRevenue: TOP_PRODUCT_REVENUE,
+      topProductRevenue: buildTopProductRevenue(activeOrders).length
+        ? buildTopProductRevenue(activeOrders)
+        : TOP_PRODUCT_REVENUE,
       lowStockProducts: LOW_STOCK_PRODUCTS,
-      recentOrders: (await getAdminOrders()).slice(0, 5),
+      recentOrders: activeOrders.slice(0, 5),
     };
   }
 
@@ -633,6 +1153,7 @@ export async function getAdminAnalytics(): Promise<AdminAnalytics> {
   const todayOrders = activeOrders.filter((order) => isSameDay(order.created_at, todayKey));
   const todayUsers = users.filter((user) => isSameDay(user.created_at, todayKey) && user.role === 'customer');
   const pendingDeliveries = activeOrders.filter((order) => !['delivered', 'cancelled'].includes(order.status));
+  const customBouquetCount = countCustomBouquetItems(activeOrders);
 
   return {
     metrics: [
@@ -659,6 +1180,12 @@ export async function getAdminAnalytics(): Promise<AdminAnalytics> {
         value: `${pendingDeliveries.length}`,
         trend: `${pendingDeliveries.filter((order) => !order.rider_id).length} unassigned`,
         accent: 'primary',
+      },
+      {
+        label: 'Custom Bouquets',
+        value: `${customBouquetCount}`,
+        trend: `${formatPrice(getCustomBouquetRevenue(activeOrders))} bespoke revenue`,
+        accent: customBouquetCount ? 'success' : 'neutral',
       },
     ],
     salesSeries: {

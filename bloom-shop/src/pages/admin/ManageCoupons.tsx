@@ -1,4 +1,4 @@
-import { Pencil, Plus, TicketPercent, Trash2 } from 'lucide-react';
+import { Pencil, Plus, Search, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import { Sidebar } from '../../components/layout/Sidebar';
@@ -6,11 +6,12 @@ import { PageWrapper } from '../../components/layout/PageWrapper';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
 import { Input } from '../../components/ui/Input';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { useNotifications } from '../../hooks/useNotifications';
 import {
   createAdminCoupon,
   deleteAdminCoupon,
-  getAdminCoupons,
+  getAdminCouponsPage,
   subscribeToAdminTable,
   updateAdminCoupon,
   updateCouponState,
@@ -93,6 +94,11 @@ function validateCouponForm(form: CouponFormState): CouponFormErrors {
 export function ManageCoupons() {
   const { showToast } = useNotifications();
   const [coupons, setCoupons] = useState<Coupon[]>([]);
+  const [search, setSearch] = useState('');
+  const [activeFilter, setActiveFilter] = useState<'all' | 'active' | 'inactive'>('all');
+  const [discountFilter, setDiscountFilter] = useState<'all' | Coupon['discount_type']>('all');
+  const [page, setPage] = useState(1);
+  const [totalCoupons, setTotalCoupons] = useState(0);
   const [loading, setLoading] = useState(true);
   const [pendingCouponId, setPendingCouponId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -100,6 +106,8 @@ export function ManageCoupons() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [form, setForm] = useState<CouponFormState>(emptyCouponForm);
   const [formErrors, setFormErrors] = useState<CouponFormErrors>({});
+  const pageSize = 10;
+  const totalPages = Math.max(1, Math.ceil(totalCoupons / pageSize));
 
   useEffect(() => {
     let active = true;
@@ -109,13 +117,20 @@ export function ManageCoupons() {
         setLoading(true);
       }
 
-      const nextCoupons = await getAdminCoupons();
+      const nextCoupons = await getAdminCouponsPage({
+        page,
+        pageSize,
+        search,
+        active: activeFilter,
+        discountType: discountFilter,
+      });
 
       if (!active) {
         return;
       }
 
-      setCoupons(nextCoupons);
+      setCoupons(nextCoupons.data);
+      setTotalCoupons(nextCoupons.total);
 
       if (showLoading) {
         setLoading(false);
@@ -132,7 +147,7 @@ export function ManageCoupons() {
       active = false;
       unsubscribe();
     };
-  }, []);
+  }, [activeFilter, discountFilter, page, search]);
 
   const openCreate = () => {
     setEditingCouponId(null);
@@ -210,6 +225,9 @@ export function ManageCoupons() {
         ? current.map((entry) => (entry.id === savedCoupon.id ? savedCoupon : entry))
         : [savedCoupon, ...current],
     );
+    const refreshed = await getAdminCouponsPage({ page, pageSize, search, active: activeFilter, discountType: discountFilter });
+    setCoupons(refreshed.data);
+    setTotalCoupons(refreshed.total);
     closeModal();
     showToast(
       editingCouponId ? 'Coupon updated' : 'Coupon created',
@@ -266,61 +284,95 @@ export function ManageCoupons() {
                 New Coupon
               </Button>
             </div>
-            <div className="coupon-grid">
-              {loading ? (
-                <Card className="coupon-card">Loading coupons...</Card>
-              ) : coupons.length ? (
-                coupons.map((coupon) => (
-                  <Card className="coupon-card" key={coupon.id}>
-                    <div className="summary-row">
-                      <strong>{coupon.code}</strong>
-                      <TicketPercent size={18} color="var(--bloom-rose)" />
-                    </div>
-                    <p>
-                      {coupon.discount_type === 'percent'
-                        ? `${coupon.discount_value}% off`
-                        : formatPrice(coupon.discount_value)}
-                    </p>
-                    <p>Min. order {formatPrice(coupon.min_order)}</p>
-                    <p>
-                      {coupon.used_count} / {coupon.max_uses} used
-                    </p>
-                    <p>{coupon.expires_at ? `Expires ${formatDate(coupon.expires_at)}` : 'No expiry set'}</p>
-                    <div className="summary-row">
-                      <span className={coupon.is_active ? 'badge badge-success' : 'badge badge-neutral'}>
-                        {coupon.is_active ? 'Active' : 'Inactive'}
-                      </span>
-                    </div>
-                    <div className="summary-row">
-                      <Button size="sm" variant="secondary" onClick={() => openEdit(coupon)}>
-                        <Pencil size={16} />
-                        Edit
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        disabled={pendingCouponId === coupon.id}
-                        onClick={() => handleDelete(coupon)}
-                      >
-                        <Trash2 size={16} />
-                        Delete
-                      </Button>
-                    </div>
-                    <div className="summary-row">
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        disabled={pendingCouponId === coupon.id}
-                        onClick={() => toggleCoupon(coupon)}
-                      >
-                        {coupon.is_active ? 'Disable' : 'Enable'}
-                      </Button>
-                    </div>
-                  </Card>
-                ))
-              ) : (
-                <Card className="coupon-card">No coupons found.</Card>
-              )}
+            <div className="search-row">
+              <Input
+                label="Search coupon code"
+                icon={<Search size={18} style={{ marginLeft: '1rem', color: 'var(--bloom-rose)' }} />}
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  setPage(1);
+                }}
+              />
+              <div className="select-shell">
+                <select
+                  value={activeFilter}
+                  onChange={(event) => {
+                    setActiveFilter(event.target.value as typeof activeFilter);
+                    setPage(1);
+                  }}
+                >
+                  <option value="all">All states</option>
+                  <option value="active">Active</option>
+                  <option value="inactive">Inactive</option>
+                </select>
+              </div>
+              <div className="select-shell">
+                <select
+                  value={discountFilter}
+                  onChange={(event) => {
+                    setDiscountFilter(event.target.value as typeof discountFilter);
+                    setPage(1);
+                  }}
+                >
+                  <option value="all">All discounts</option>
+                  <option value="percent">Percent</option>
+                  <option value="fixed">Fixed</option>
+                </select>
+              </div>
+            </div>
+            <div className="table-shell">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Code</th>
+                    <th>Type</th>
+                    <th>Value</th>
+                    <th>Min Order</th>
+                    <th>Uses</th>
+                    <th>Expires</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loading ? (
+                    <tr><td colSpan={8}><Skeleton style={{ minHeight: '3rem' }} /></td></tr>
+                  ) : coupons.length ? (
+                    coupons.map((coupon) => (
+                      <tr key={coupon.id}>
+                        <td>{coupon.code}</td>
+                        <td>{coupon.discount_type}</td>
+                        <td>{coupon.discount_type === 'percent' ? `${coupon.discount_value}%` : formatPrice(coupon.discount_value)}</td>
+                        <td>{formatPrice(coupon.min_order)}</td>
+                        <td>{coupon.used_count} / {coupon.max_uses}</td>
+                        <td>{coupon.expires_at ? formatDate(coupon.expires_at) : 'None'}</td>
+                        <td><span className={coupon.is_active ? 'badge badge-success' : 'badge badge-neutral'}>{coupon.is_active ? 'Active' : 'Inactive'}</span></td>
+                        <td>
+                          <div className="summary-row">
+                            <Button size="sm" variant="secondary" onClick={() => openEdit(coupon)}><Pencil size={16} />Edit</Button>
+                            <Button size="sm" variant="secondary" disabled={pendingCouponId === coupon.id} onClick={() => toggleCoupon(coupon)}>
+                              {coupon.is_active ? 'Disable' : 'Enable'}
+                            </Button>
+                            <Button size="sm" variant="ghost" disabled={pendingCouponId === coupon.id} onClick={() => handleDelete(coupon)}>
+                              <Trash2 size={16} />Delete
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr><td colSpan={8}>No coupons matched those filters.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="pagination-row">
+              <span>Page {page} of {totalPages} - {totalCoupons} coupons</span>
+              <div className="summary-row">
+                <Button size="sm" variant="secondary" disabled={page <= 1} onClick={() => setPage((current) => current - 1)}>Previous</Button>
+                <Button size="sm" variant="secondary" disabled={page >= totalPages} onClick={() => setPage((current) => current + 1)}>Next</Button>
+              </div>
             </div>
           </Card>
         </div>

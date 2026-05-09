@@ -3,6 +3,7 @@ import { useMemo } from 'react';
 import { Sidebar } from '../../components/layout/Sidebar';
 import { PageWrapper } from '../../components/layout/PageWrapper';
 import { Card } from '../../components/ui/Card';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { useAuth } from '../../hooks/useAuth';
 import { useOrdersForUserQuery } from '../../hooks/useAppQueries';
 import { useRealtimeQueryInvalidation } from '../../hooks/useRealtimeQueryInvalidation';
@@ -46,7 +47,11 @@ export function DeliveryHistory() {
             </div>
             <div className="history-list">
               {isLoading ? (
-                <Card className="history-card">Loading delivery history...</Card>
+                <>
+                  <Skeleton style={{ minHeight: '6rem' }} />
+                  <Skeleton style={{ minHeight: '6rem' }} />
+                  <Skeleton style={{ minHeight: '6rem' }} />
+                </>
               ) : history.length ? (
                 history.map((order) => (
                   <Card className="history-card" key={order.id}>

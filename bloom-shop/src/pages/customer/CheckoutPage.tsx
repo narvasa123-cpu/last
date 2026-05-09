@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { CheckoutStepper } from '../../components/checkout/CheckoutStepper';
@@ -12,8 +12,11 @@ import { useAuth } from '../../hooks/useAuth';
 import { useCart } from '../../hooks/useCart';
 import { useNotifications } from '../../hooks/useNotifications';
 import { MOCK_COUPONS } from '../../lib/constants';
+import { getCustomerAddresses } from '../../lib/data';
+import { createDemoOrderFromCart } from '../../lib/orders';
 import { isSupabaseConfigured, supabase } from '../../lib/supabase';
-import { calcPoints, formatPrice, getTodayISO } from '../../lib/utils';
+import type { DeliveryAddress } from '../../lib/types';
+import { calcPoints, getTodayISO } from '../../lib/utils';
 
 type DeliveryErrors = Partial<Record<keyof DeliveryFormState, string>>;
 
@@ -50,8 +53,37 @@ export function CheckoutPage() {
     cvv: '',
     cardholder: profile?.full_name ?? '',
   });
+  const [addresses, setAddresses] = useState<DeliveryAddress[]>([]);
+  const [selectedAddressId, setSelectedAddressId] = useState('');
 
   const pointsPreview = useMemo(() => calcPoints(totals.total), [totals.total]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    getCustomerAddresses(user.id, profile).then((nextAddresses) => {
+      setAddresses(nextAddresses);
+      const defaultAddress = nextAddresses.find((address) => address.is_default) ?? nextAddresses[0];
+      if (defaultAddress && !selectedAddressId) {
+        setSelectedAddressId(defaultAddress.id);
+        setDelivery((current) => ({
+          ...current,
+          address: defaultAddress.address,
+          notes: current.notes || defaultAddress.delivery_notes || '',
+        }));
+      }
+    });
+  }, [profile?.address, user?.id]);
+
+  const handleSelectAddress = (addressId: string) => {
+    setSelectedAddressId(addressId);
+    const selected = addresses.find((address) => address.id === addressId);
+    if (!selected) return;
+    setDelivery((current) => ({
+      ...current,
+      address: selected.address,
+      notes: current.notes || selected.delivery_notes || '',
+    }));
+  };
 
   const validateStep = () => {
     if (step === 0) {
@@ -106,6 +138,22 @@ export function CheckoutPage() {
     const status = paymentMethod === 'cod' ? 'pending' : 'confirmed';
     const paymentStatus = paymentMethod === 'cod' ? 'unpaid' : 'pending';
     const generatedOrderId = crypto.randomUUID();
+    const saveFallbackOrder = () =>
+      createDemoOrderFromCart({
+        id: generatedOrderId,
+        customer: profile,
+        items,
+        totalAmount: totals.total,
+        deliveryFee: totals.deliveryFee,
+        discountAmount: totals.discount,
+        couponId: coupon?.id ?? null,
+        paymentMethod,
+        deliveryAddress: delivery.address,
+        deliveryDate: delivery.deliveryDate,
+        deliveryTime: delivery.deliveryTime,
+        notes: delivery.notes,
+        gcashReference,
+      });
 
     if (isSupabaseConfigured) {
       try {
@@ -131,15 +179,80 @@ export function CheckoutPage() {
 
         if (orderError) throw orderError;
 
-        await supabase.from('order_items').insert(
-          items.map((line) => ({
-            order_id: insertedOrder.id,
-            product_id: line.product.id,
-            quantity: line.quantity,
-            unit_price: line.product.price,
-            subtotal: line.product.price * line.quantity,
-          })),
-        );
+        const orderItemsWithBouquetData = items.map((line) => ({
+          order_id: insertedOrder.id,
+          product_id: line.product.custom_bouquet ? null : line.product.id,
+          quantity: line.quantity,
+          unit_price: line.product.price,
+          subtotal: line.product.price * line.quantity,
+          custom_bouquet: line.product.custom_bouquet ?? null,
+        }));
+
+        const { error: itemInsertError } = await supabase.from('order_items').insert(orderItemsWithBouquetData);
+
+        if (itemInsertError) {
+          const errorMessage = String(itemInsertError.message ?? itemInsertError).toLowerCase();
+          const isMissingCustomBouquetColumn =
+            errorMessage.includes('custom_bouquet') ||
+            errorMessage.includes('column') ||
+            errorMessage.includes('does not exist');
+
+          if (!isMissingCustomBouquetColumn) {
+            throw itemInsertError;
+          }
+
+          const fallbackItems = await Promise.all(
+            items.map(async (line) => {
+              let productId = line.product.id;
+
+              if (line.product.custom_bouquet) {
+                const { data: customProduct, error: customProductError } = await supabase
+                  .from('products')
+                  .insert({
+                    name: line.product.name,
+                    description: line.product.description,
+                    category: line.product.category,
+                    price: line.product.price,
+                    image_url: line.product.image_url,
+                    stock: 999,
+                    is_featured: false,
+                  })
+                  .select('id')
+                  .single();
+
+                if (customProductError) {
+                  const isForbidden =
+                    (customProductError as { code?: string; statusCode?: number }).statusCode === 403 ||
+                    (customProductError as { code?: string }).code === '42501' ||
+                    String(customProductError.message ?? customProductError).toLowerCase().includes('policy');
+                  if (isForbidden) {
+                    throw new Error(
+                      'Custom bouquet checkout requires the latest database migration (007_custom_bouquet_order_items). Please apply migrations and try again.',
+                    );
+                  }
+                  throw customProductError ?? new Error('Unable to create custom bouquet product.');
+                }
+
+                if (!customProduct) {
+                  throw new Error('Unable to create custom bouquet product.');
+                }
+
+                productId = customProduct.id;
+              }
+
+              return {
+                order_id: insertedOrder.id,
+                product_id: productId,
+                quantity: line.quantity,
+                unit_price: line.product.price,
+                subtotal: line.product.price * line.quantity,
+              };
+            }),
+          );
+
+          const { error: fallbackItemInsertError } = await supabase.from('order_items').insert(fallbackItems);
+          if (fallbackItemInsertError) throw fallbackItemInsertError;
+        }
 
         await supabase.from('payments').insert({
           order_id: insertedOrder.id,
@@ -173,9 +286,11 @@ export function CheckoutPage() {
         await refreshProfile(user.id);
         setSuccessOrderId(insertedOrder.id);
       } catch {
+        saveFallbackOrder();
         setSuccessOrderId(generatedOrderId);
       }
     } else {
+      saveFallbackOrder();
       setSuccessOrderId(generatedOrderId);
     }
 
@@ -253,7 +368,30 @@ export function CheckoutPage() {
             <section className="checkout-layout">
               <Card className="summary-card">
                 {step === 0 ? (
-                  <DeliveryScheduler value={delivery} onChange={setDelivery} errors={errors} />
+                  <div className="section">
+                    {addresses.length ? (
+                      <div className="field-stack">
+                        <label>Saved Addresses</label>
+                        <div className="time-slot-grid">
+                          {addresses.map((address) => (
+                            <button
+                              key={address.id}
+                              className={selectedAddressId === address.id ? 'payment-card active' : 'payment-card'}
+                              type="button"
+                              onClick={() => handleSelectAddress(address.id)}
+                            >
+                              <div className="section" style={{ gap: '0.2rem', textAlign: 'left' }}>
+                                <strong>{address.label}</strong>
+                                <span>{address.address}</span>
+                                {address.is_default ? <span className="badge badge-success">Default</span> : null}
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                    <DeliveryScheduler value={delivery} onChange={setDelivery} errors={errors} />
+                  </div>
                 ) : null}
                 {step === 1 ? (
                   <PaymentSelector

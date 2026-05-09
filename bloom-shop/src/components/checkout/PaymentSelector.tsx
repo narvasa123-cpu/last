@@ -13,8 +13,8 @@ export interface CardFormState {
 }
 
 interface PaymentSelectorProps {
-  method: PaymentMethod;
-  onMethodChange: (method: PaymentMethod) => void;
+  method: CheckoutPaymentMethod;
+  onMethodChange: (method: CheckoutPaymentMethod) => void;
   couponCode: string;
   onCouponCodeChange: (value: string) => void;
   onApplyCoupon: () => void;
@@ -191,3 +191,4 @@ export function PaymentSelector({
     </div>
   );
 }
+type CheckoutPaymentMethod = Exclude<PaymentMethod, 'cash'>;

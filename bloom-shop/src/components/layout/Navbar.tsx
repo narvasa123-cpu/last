@@ -1,14 +1,16 @@
 import {
   Bell,
+  CheckCircle2,
   Flower2,
   Heart,
   LogOut,
+  Mail,
   Menu,
   ShoppingBag,
   UserCircle2,
   X,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 
 import { useAuth } from '../../hooks/useAuth';
@@ -22,6 +24,7 @@ import { Card } from '../ui/Card';
 const navItems: NavLinkItem[] = [
   { label: 'Home', to: '/' },
   { label: 'Shop', to: '/shop' },
+  { label: 'Custom Bouquet', to: '/custom-bouquet' },
   { label: 'Orders', to: '/customer/orders', roles: ['customer'] },
   { label: 'Rewards', to: '/customer/rewards', roles: ['customer'] },
   { label: 'Admin', to: '/admin', roles: ['admin'] },
@@ -41,12 +44,24 @@ export function Navbar() {
   const navigate = useNavigate();
   const { user, profile, role, signOut } = useAuth();
   const { totals, toggleDrawer } = useCart();
-  const { notifications, unreadCount, markAllAsRead, showToast } = useNotifications();
+  const { notifications, unreadCount, markAllAsRead, markNotificationRead, showToast } = useNotifications();
   const [menuOpen, setMenuOpen] = useState(false);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+  const notificationRef = useRef<HTMLDivElement | null>(null);
 
   const links = filterLinks(role, Boolean(user));
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+    function handleClick(event: MouseEvent) {
+      if (notificationRef.current && !notificationRef.current.contains(event.target as Node)) {
+        setNotificationOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [notificationOpen]);
 
   const handleSignOut = async () => {
     if (signingOut) {
@@ -103,7 +118,7 @@ export function Navbar() {
           </nav>
 
           <div className="nav-actions">
-            <div style={{ position: 'relative' }}>
+            <div style={{ position: 'relative' }} ref={notificationRef}>
               <button
                 className="icon-button"
                 onClick={() => setNotificationOpen((current) => !current)}
@@ -131,6 +146,14 @@ export function Navbar() {
                           {!item.is_read ? <span className="badge badge-primary">New</span> : null}
                         </div>
                         <p>{item.message}</p>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => markNotificationRead(item.id, !item.is_read)}
+                        >
+                          {item.is_read ? <Mail size={16} /> : <CheckCircle2 size={16} />}
+                          {item.is_read ? 'Mark unread' : 'Mark read'}
+                        </Button>
                       </div>
                     ))}
                     {!notifications.length ? (

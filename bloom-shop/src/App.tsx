@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, Outlet, Route, Routes } from 'react-router-dom
 import { CartDrawer } from './components/cart/CartDrawer';
 import { FloatingPetals } from './components/layout/FloatingPetals';
 import { Navbar } from './components/layout/Navbar';
+import { ScrollToTop } from './components/layout/ScrollToTop';
 import { FullPageSpinner } from './components/ui/Spinner';
 import { ToastViewport } from './components/ui/Toast';
 import { AuthProvider, useAuth } from './hooks/useAuth';
@@ -12,6 +13,9 @@ import type { Role } from './lib/types';
 
 const HomePage = lazy(() => import('./pages/public/HomePage').then((module) => ({ default: module.HomePage })));
 const ShopPage = lazy(() => import('./pages/public/ShopPage').then((module) => ({ default: module.ShopPage })));
+const CustomBouquetPage = lazy(() =>
+  import('./pages/public/CustomBouquetPage').then((module) => ({ default: module.CustomBouquetPage })),
+);
 const ProductDetailPage = lazy(() =>
   import('./pages/public/ProductDetailPage').then((module) => ({ default: module.ProductDetailPage })),
 );
@@ -56,11 +60,20 @@ const ManageCoupons = lazy(() =>
 const ReportsPage = lazy(() =>
   import('./pages/admin/ReportsPage').then((module) => ({ default: module.ReportsPage })),
 );
+const ReviewsPage = lazy(() =>
+  import('./pages/admin/ReviewsPage').then((module) => ({ default: module.ReviewsPage })),
+);
+const ActivityPage = lazy(() =>
+  import('./pages/admin/ActivityPage').then((module) => ({ default: module.ActivityPage })),
+);
 const RiderDashboard = lazy(() =>
   import('./pages/rider/RiderDashboard').then((module) => ({ default: module.RiderDashboard })),
 );
 const ActiveDelivery = lazy(() =>
   import('./pages/rider/ActiveDelivery').then((module) => ({ default: module.ActiveDelivery })),
+);
+const EarningsDashboard = lazy(() =>
+  import('./pages/rider/EarningsDashboard').then((module) => ({ default: module.EarningsDashboard })),
 );
 const DeliveryHistory = lazy(() =>
   import('./pages/rider/DeliveryHistory').then((module) => ({ default: module.DeliveryHistory })),
@@ -73,6 +86,12 @@ const ConfirmPayment = lazy(() =>
 );
 const WalkInOrder = lazy(() =>
   import('./pages/cashier/WalkInOrder').then((module) => ({ default: module.WalkInOrder })),
+);
+const Refunds = lazy(() =>
+  import('./pages/cashier/Refunds').then((module) => ({ default: module.Refunds })),
+);
+const CloseShift = lazy(() =>
+  import('./pages/cashier/CloseShift').then((module) => ({ default: module.CloseShift })),
 );
 const NotFoundPage = lazy(() =>
   import('./pages/NotFoundPage').then((module) => ({ default: module.NotFoundPage })),
@@ -111,10 +130,12 @@ function AppRoutes() {
         <Route element={<AppLayout />}>
           <Route path="/" element={<HomePage />} />
           <Route path="/shop" element={<ShopPage />} />
+          <Route path="/custom-bouquet" element={<CustomBouquetPage />} />
           <Route path="/product/:id" element={<ProductDetailPage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
 
+          <Route path="/customer" element={<Navigate to="/customer/profile" replace />} />
           <Route
             path="/customer/cart"
             element={
@@ -228,6 +249,22 @@ function AppRoutes() {
               </AuthGuard>
             }
           />
+          <Route
+            path="/admin/reviews"
+            element={
+              <AuthGuard allowedRoles={['admin']}>
+                <ReviewsPage />
+              </AuthGuard>
+            }
+          />
+          <Route
+            path="/admin/activity"
+            element={
+              <AuthGuard allowedRoles={['admin']}>
+                <ActivityPage />
+              </AuthGuard>
+            }
+          />
 
           <Route
             path="/rider"
@@ -250,6 +287,22 @@ function AppRoutes() {
             element={
               <AuthGuard allowedRoles={['rider']}>
                 <DeliveryHistory />
+              </AuthGuard>
+            }
+          />
+          <Route
+            path="/rider/earnings"
+            element={
+              <AuthGuard allowedRoles={['rider']}>
+                <EarningsDashboard />
+              </AuthGuard>
+            }
+          />
+          <Route
+            path="/rider/profile"
+            element={
+              <AuthGuard allowedRoles={['rider']}>
+                <ProfilePage />
               </AuthGuard>
             }
           />
@@ -278,6 +331,22 @@ function AppRoutes() {
               </AuthGuard>
             }
           />
+          <Route
+            path="/cashier/refunds"
+            element={
+              <AuthGuard allowedRoles={['cashier']}>
+                <Refunds />
+              </AuthGuard>
+            }
+          />
+          <Route
+            path="/cashier/close-shift"
+            element={
+              <AuthGuard allowedRoles={['cashier']}>
+                <CloseShift />
+              </AuthGuard>
+            }
+          />
 
           <Route path="*" element={<NotFoundPage />} />
         </Route>
@@ -288,7 +357,8 @@ function AppRoutes() {
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <ScrollToTop />
       <AuthProvider>
         <NotificationsProvider>
           <AppRoutes />

@@ -27,6 +27,7 @@ interface NotificationsContextValue {
   showToast: (title: string, message: string) => void;
   dismissToast: (id: string) => void;
   markAllAsRead: () => Promise<void>;
+  markNotificationRead: (id: string, isRead: boolean) => Promise<void>;
   refetchNotifications: () => Promise<void>;
 }
 
@@ -83,6 +84,22 @@ export function NotificationsProvider({ children }: PropsWithChildren) {
     }
   };
 
+  const markNotificationRead = async (id: string, isRead: boolean) => {
+    if (!user?.id) return;
+
+    setNotifications((current) =>
+      current.map((item) => (item.id === id ? { ...item, is_read: isRead } : item)),
+    );
+
+    if (isSupabaseConfigured) {
+      await supabase
+        .from('notifications')
+        .update({ is_read: isRead })
+        .eq('user_id', user.id)
+        .eq('id', id);
+    }
+  };
+
   useEffect(() => {
     refetchNotifications();
   }, [user?.id]);
@@ -122,6 +139,7 @@ export function NotificationsProvider({ children }: PropsWithChildren) {
       showToast,
       dismissToast,
       markAllAsRead,
+      markNotificationRead,
       refetchNotifications,
     }),
     [loading, notifications, toasts],

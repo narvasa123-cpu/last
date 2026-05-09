@@ -9,7 +9,6 @@ import { Input } from '../../components/ui/Input';
 import { useAuth } from '../../hooks/useAuth';
 import { ROLE_ROUTES } from '../../lib/constants';
 import { isDemoMode } from '../../lib/supabase';
-import type { Role } from '../../lib/types';
 
 export function RegisterPage() {
   const navigate = useNavigate();
@@ -20,7 +19,6 @@ export function RegisterPage() {
   const [address, setAddress] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [selectedRole, setSelectedRole] = useState<Role>('customer');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -48,7 +46,6 @@ export function RegisterPage() {
       password,
       phone,
       address,
-      role: selectedRole,
     });
     setLoading(false);
 
@@ -103,21 +100,6 @@ export function RegisterPage() {
               onChange={(event) => setPhone(event.target.value)}
             />
             <Input label="Address" value={address} onChange={(event) => setAddress(event.target.value)} />
-            <div className="field-stack">
-              <label htmlFor="role">Role</label>
-              <div className="select-shell">
-                <select
-                  id="role"
-                  value={selectedRole}
-                  onChange={(event) => setSelectedRole(event.target.value as Role)}
-                >
-                  <option value="customer">Customer</option>
-                  <option value="admin">Admin</option>
-                  <option value="rider">Rider</option>
-                  <option value="cashier">Cashier</option>
-                </select>
-              </div>
-            </div>
             <Input
               label="Password"
               type="password"

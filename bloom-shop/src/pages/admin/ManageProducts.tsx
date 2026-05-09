@@ -1,5 +1,5 @@
-import { Pencil, Plus, Search, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { History, Pencil, Plus, Search, SlidersHorizontal, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { Sidebar } from '../../components/layout/Sidebar';
 import { PageWrapper } from '../../components/layout/PageWrapper';
@@ -12,12 +12,15 @@ import { useNotifications } from '../../hooks/useNotifications';
 import {
   createAdminProduct,
   deleteAdminProduct,
-  getAdminProducts,
+  bulkAdjustProductStock,
+  getAdminProductsPage,
+  getStockChangeLogs,
   subscribeToAdminTable,
   updateAdminProduct,
+  updateProductFeatured,
   uploadAdminProductImage,
 } from '../../lib/admin';
-import type { Product, ProductCategory } from '../../lib/types';
+import type { Product, ProductCategory, StockChangeLog } from '../../lib/types';
 import { createEmptyFlowerSvg, formatPrice } from '../../lib/utils';
 
 type ProductFormState = {
@@ -90,6 +93,14 @@ export function ManageProducts() {
   const { showToast } = useNotifications();
   const [products, setProducts] = useState<Product[]>([]);
   const [search, setSearch] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState<ProductCategory | 'all'>('all');
+  const [featuredFilter, setFeaturedFilter] = useState<'all' | 'featured' | 'standard'>('all');
+  const [stockFilter, setStockFilter] = useState<'all' | 'low' | 'out'>('all');
+  const [page, setPage] = useState(1);
+  const [totalProducts, setTotalProducts] = useState(0);
+  const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
+  const [stockDelta, setStockDelta] = useState('10');
+  const [stockHistory, setStockHistory] = useState<StockChangeLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [deletingProductId, setDeletingProductId] = useState<string | null>(null);
@@ -100,6 +111,32 @@ export function ManageProducts() {
   const [selectedImageFile, setSelectedImageFile] = useState<File | null>(null);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const pageSize = 10;
+
+  const syncProducts = useCallback(async (showLoading = false) => {
+    if (showLoading) {
+      setLoading(true);
+    }
+
+    const nextProducts = await getAdminProductsPage({
+      page,
+      pageSize,
+      search,
+      category: categoryFilter,
+      featured: featuredFilter,
+      stock: stockFilter,
+    });
+
+    setProducts(nextProducts.data);
+    setTotalProducts(nextProducts.total);
+    setSelectedProductIds((current) => current.filter((id) => nextProducts.data.some((product) => product.id === id)));
+    setLoading(false);
+  }, [categoryFilter, featuredFilter, page, search, stockFilter]);
+
+  const loadStockHistory = useCallback(async () => {
+    const logs = await getStockChangeLogs({ page: 1, pageSize: 6 });
+    setStockHistory(logs.data);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -109,13 +146,21 @@ export function ManageProducts() {
         setLoading(true);
       }
 
-      const nextProducts = await getAdminProducts();
+      const nextProducts = await getAdminProductsPage({
+        page,
+        pageSize,
+        search,
+        category: categoryFilter,
+        featured: featuredFilter,
+        stock: stockFilter,
+      });
 
       if (!active) {
         return;
       }
 
-      setProducts(nextProducts);
+      setProducts(nextProducts.data);
+      setTotalProducts(nextProducts.total);
 
       if (showLoading) {
         setLoading(false);
@@ -123,16 +168,18 @@ export function ManageProducts() {
     }
 
     void syncProducts(true);
+    void loadStockHistory();
 
     const unsubscribe = subscribeToAdminTable('products', () => {
       void syncProducts();
+      void loadStockHistory();
     });
 
     return () => {
       active = false;
       unsubscribe();
     };
-  }, []);
+  }, [categoryFilter, featuredFilter, loadStockHistory, page, search, stockFilter]);
 
   useEffect(() => {
     if (!selectedImageFile) {
@@ -148,14 +195,7 @@ export function ManageProducts() {
     };
   }, [selectedImageFile]);
 
-  const filtered = useMemo(
-    () =>
-      products.filter((product) => {
-        const query = search.toLowerCase();
-        return !query || product.name.toLowerCase().includes(query) || product.category.includes(query);
-      }),
-    [products, search],
-  );
+  const totalPages = Math.max(1, Math.ceil(totalProducts / pageSize));
 
   function resetFormState(nextForm: ProductFormState = emptyProductForm) {
     setForm(nextForm);
@@ -259,6 +299,8 @@ export function ManageProducts() {
         ? current.map((entry) => (entry.id === savedProduct.id ? savedProduct : entry))
         : [savedProduct, ...current],
     );
+    void syncProducts();
+    void loadStockHistory();
     setIsModalOpen(false);
     setEditingProductId(null);
     resetFormState(emptyProductForm);
@@ -266,6 +308,44 @@ export function ManageProducts() {
       editingProductId ? 'Product updated' : 'Product created',
       `${savedProduct.name} is now saved in the catalog.`,
     );
+  };
+
+  const toggleSelected = (productId: string) => {
+    setSelectedProductIds((current) =>
+      current.includes(productId) ? current.filter((id) => id !== productId) : [...current, productId],
+    );
+  };
+
+  const handleFeaturedToggle = async (product: Product) => {
+    const { data, error } = await updateProductFeatured(product.id, !product.is_featured);
+
+    if (error || !data) {
+      showToast('Featured update failed', error ?? 'Unable to update this product.');
+      return;
+    }
+
+    setProducts((current) => current.map((entry) => (entry.id === data.id ? data : entry)));
+    showToast('Product updated', `${data.name} is now ${data.is_featured ? 'featured' : 'standard'}.`);
+  };
+
+  const handleBulkStockAdjustment = async () => {
+    const delta = Number(stockDelta);
+    if (!Number.isInteger(delta) || delta === 0) {
+      showToast('Check stock adjustment', 'Use a whole number such as 10 or -5.');
+      return;
+    }
+
+    const { data, error } = await bulkAdjustProductStock(selectedProductIds, delta);
+
+    if (error) {
+      showToast('Bulk adjustment failed', error);
+      return;
+    }
+
+    setProducts((current) => current.map((product) => data.find((entry) => entry.id === product.id) ?? product));
+    setSelectedProductIds([]);
+    void loadStockHistory();
+    showToast('Stock adjusted', `${data.length} products were updated.`);
   };
 
   const handleDelete = async (product: Product) => {
@@ -315,13 +395,92 @@ export function ManageProducts() {
                 label="Search catalog"
                 icon={<Search size={18} style={{ marginLeft: '1rem', color: 'var(--bloom-rose)' }} />}
                 value={search}
-                onChange={(event) => setSearch(event.target.value)}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  setPage(1);
+                }}
               />
+              <div className="field-stack">
+                <label htmlFor="product-category-filter">Category</label>
+                <div className="select-shell">
+                  <select
+                    id="product-category-filter"
+                    value={categoryFilter}
+                    onChange={(event) => {
+                      setCategoryFilter(event.target.value as ProductCategory | 'all');
+                      setPage(1);
+                    }}
+                  >
+                    <option value="all">All categories</option>
+                    <option value="roses">roses</option>
+                    <option value="tulips">tulips</option>
+                    <option value="mixed">mixed</option>
+                    <option value="sunflowers">sunflowers</option>
+                    <option value="orchids">orchids</option>
+                  </select>
+                </div>
+              </div>
+              <div className="field-stack">
+                <label htmlFor="product-featured-filter">Featured</label>
+                <div className="select-shell">
+                  <select
+                    id="product-featured-filter"
+                    value={featuredFilter}
+                    onChange={(event) => {
+                      setFeaturedFilter(event.target.value as typeof featuredFilter);
+                      setPage(1);
+                    }}
+                  >
+                    <option value="all">All</option>
+                    <option value="featured">Featured</option>
+                    <option value="standard">Standard</option>
+                  </select>
+                </div>
+              </div>
+              <div className="field-stack">
+                <label htmlFor="product-stock-filter">Stock</label>
+                <div className="select-shell">
+                  <select
+                    id="product-stock-filter"
+                    value={stockFilter}
+                    onChange={(event) => {
+                      setStockFilter(event.target.value as typeof stockFilter);
+                      setPage(1);
+                    }}
+                  >
+                    <option value="all">All stock</option>
+                    <option value="low">Low stock</option>
+                    <option value="out">Out of stock</option>
+                  </select>
+                </div>
+              </div>
             </div>
+            <Card className="summary-card admin-compact-card">
+              <div className="summary-row">
+                <div className="section" style={{ gap: '0.2rem' }}>
+                  <strong><SlidersHorizontal size={16} /> Bulk stock adjustment</strong>
+                  <p>{selectedProductIds.length} selected products</p>
+                </div>
+                <div className="summary-row">
+                  <Input
+                    label="Delta"
+                    type="number"
+                    step="1"
+                    value={stockDelta}
+                    onChange={(event) => setStockDelta(event.target.value)}
+                    style={{ maxWidth: '8rem' }}
+                  />
+                  <Button size="sm" disabled={!selectedProductIds.length} onClick={handleBulkStockAdjustment}>
+                    Apply
+                  </Button>
+                </div>
+              </div>
+            </Card>
             <div className="table-shell">
               <table className="table">
                 <thead>
                   <tr>
+                    <th>Select</th>
                     <th>Name</th>
                     <th>Category</th>
                     <th>Price</th>
@@ -333,19 +492,33 @@ export function ManageProducts() {
                 <tbody>
                   {loading ? (
                     <tr>
-                      <td colSpan={6}>Loading products...</td>
+                      <td colSpan={7}>Loading products...</td>
                     </tr>
-                  ) : filtered.length ? (
-                    filtered.map((product) => (
+                  ) : products.length ? (
+                    products.map((product) => (
                       <tr key={product.id}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            aria-label={`Select ${product.name}`}
+                            checked={selectedProductIds.includes(product.id)}
+                            onChange={() => toggleSelected(product.id)}
+                          />
+                        </td>
                         <td>{product.name}</td>
                         <td>{product.category}</td>
                         <td>{formatPrice(product.price)}</td>
                         <td>{product.stock}</td>
                         <td>
-                          <Badge variant={product.is_featured ? 'success' : 'neutral'}>
-                            {product.is_featured ? 'Featured' : 'Standard'}
-                          </Badge>
+                          <button
+                            type="button"
+                            className="chip-button"
+                            onClick={() => handleFeaturedToggle(product)}
+                          >
+                            <Badge variant={product.is_featured ? 'success' : 'neutral'}>
+                              {product.is_featured ? 'Featured' : 'Standard'}
+                            </Badge>
+                          </button>
                         </td>
                         <td>
                           <div className="summary-row" style={{ justifyContent: 'flex-start' }}>
@@ -368,12 +541,38 @@ export function ManageProducts() {
                     ))
                   ) : (
                     <tr>
-                      <td colSpan={6}>No products matched that search.</td>
+                      <td colSpan={7}>No products matched that search.</td>
                     </tr>
                   )}
                 </tbody>
               </table>
             </div>
+            <div className="pagination-row">
+              <span>Page {page} of {totalPages} - {totalProducts} products</span>
+              <div className="summary-row">
+                <Button size="sm" variant="secondary" disabled={page <= 1} onClick={() => setPage((current) => current - 1)}>
+                  Previous
+                </Button>
+                <Button size="sm" variant="secondary" disabled={page >= totalPages} onClick={() => setPage((current) => current + 1)}>
+                  Next
+                </Button>
+              </div>
+            </div>
+            <Card className="summary-card admin-compact-card">
+              <div className="section" style={{ gap: '0.35rem' }}>
+                <strong><History size={16} /> Stock change history</strong>
+                {stockHistory.length ? (
+                  stockHistory.map((log) => (
+                    <div className="summary-row" key={log.id}>
+                      <span>{log.product?.name ?? log.product_id}</span>
+                      <strong className="tabular-nums">{log.previous_stock} to {log.next_stock}</strong>
+                    </div>
+                  ))
+                ) : (
+                  <p>No stock changes recorded yet.</p>
+                )}
+              </div>
+            </Card>
           </Card>
         </div>
       </div>

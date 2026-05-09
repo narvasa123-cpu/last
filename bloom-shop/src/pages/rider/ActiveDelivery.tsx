@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import { useQueryClient } from '@tanstack/react-query';
 
@@ -7,15 +7,25 @@ import { PageWrapper } from '../../components/layout/PageWrapper';
 import { TrackingMap } from '../../components/orders/TrackingMap';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
+import { Textarea } from '../../components/ui/Input';
+import { Modal } from '../../components/ui/Modal';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { useAuth } from '../../hooks/useAuth';
 import { useOrderTrackingQuery, useOrdersForUserQuery } from '../../hooks/useAppQueries';
 import { useNotifications } from '../../hooks/useNotifications';
 import { useRealtimeQueryInvalidation } from '../../hooks/useRealtimeQueryInvalidation';
 import { STATUS_LABELS } from '../../lib/constants';
-import { createDeliveryTrackingPoint, estimateOrderEta, updateOrderStatus } from '../../lib/orders';
+import {
+  createDeliveryPhoto,
+  createDeliveryTrackingPoint,
+  estimateOrderEta,
+  reportDeliveryIssue,
+  updateOrderStatus,
+  uploadDeliveryProofImage,
+} from '../../lib/orders';
 import { queryKeys } from '../../lib/queryClient';
 import { BASE_TRACKING_ROUTE } from '../../lib/trackingRoute';
-import type { DeliveryTrackingPoint, Order } from '../../lib/types';
+import type { DeliveryIssueReason, DeliveryTrackingPoint, Order } from '../../lib/types';
 import { cn, formatDateTime } from '../../lib/utils';
 
 const previewRoute = BASE_TRACKING_ROUTE;
@@ -51,6 +61,29 @@ const riderWorkflowSteps: RiderWorkflowStep[] = [
     actionStatus: 'delivered',
   },
 ];
+
+const issueOptions: Array<{ value: DeliveryIssueReason; label: string }> = [
+  { value: 'wrong_address', label: 'Wrong address' },
+  { value: 'customer_unreachable', label: 'Customer unreachable' },
+  { value: 'damaged_bouquet', label: 'Damaged bouquet' },
+  { value: 'other', label: 'Other' },
+];
+
+type QueuedStatusUpdate = {
+  orderId: string;
+  riderId: string;
+  targetStatus: Order['status'];
+  proofImageUrl?: string | null;
+  createdAt: string;
+};
+
+function getActiveDeliveryCacheKey(riderId?: string | null) {
+  return `bloom-shop:rider-active-delivery:${riderId ?? 'guest'}`;
+}
+
+function getPendingStatusQueueKey(riderId?: string | null) {
+  return `bloom-shop:rider-pending-status-updates:${riderId ?? 'guest'}`;
+}
 
 function getWorkflowStage(status: Order['status']) {
   if (status === 'picked_up') return 1;
@@ -93,6 +126,14 @@ export function ActiveDelivery() {
   const { showToast } = useNotifications();
   const [sharingLocation, setSharingLocation] = useState(false);
   const [sendingPreview, setSendingPreview] = useState(false);
+  const [proofFile, setProofFile] = useState<File | null>(null);
+  const [proofPreview, setProofPreview] = useState<string | null>(null);
+  const [delivering, setDelivering] = useState(false);
+  const [issueModalOpen, setIssueModalOpen] = useState(false);
+  const [issueReason, setIssueReason] = useState<DeliveryIssueReason>('wrong_address');
+  const [issueNotes, setIssueNotes] = useState('');
+  const [cachedOrder, setCachedOrder] = useState<Order | null>(null);
+  const [isOnline, setIsOnline] = useState(() => (typeof navigator === 'undefined' ? true : navigator.onLine));
   const riderOrdersQuery = useOrdersForUserQuery(user?.id, 'rider');
   const orders = riderOrdersQuery.data ?? ([] as Order[]);
 
@@ -120,6 +161,7 @@ export function ActiveDelivery() {
         })[0] ?? null
     );
   }, [orders, user?.id]);
+  const displayOrder = activeOrder ?? cachedOrder;
   const trackingQuery = useOrderTrackingQuery(activeOrder?.id);
   const trackingPoints = trackingQuery.data ?? ([] as DeliveryTrackingPoint[]);
   const loading = riderOrdersQuery.isLoading || (Boolean(activeOrder?.id) && trackingQuery.isLoading);
@@ -141,6 +183,97 @@ export function ActiveDelivery() {
   );
 
   const latestTrackingPoint = trackingPoints.length ? trackingPoints[trackingPoints.length - 1] : null;
+
+  useEffect(() => {
+    if (!user?.id) return;
+
+    const cached = window.localStorage.getItem(getActiveDeliveryCacheKey(user.id));
+    if (cached) {
+      try {
+        setCachedOrder(JSON.parse(cached) as Order);
+      } catch {
+        window.localStorage.removeItem(getActiveDeliveryCacheKey(user.id));
+      }
+    }
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (!user?.id || !activeOrder) return;
+    window.localStorage.setItem(getActiveDeliveryCacheKey(user.id), JSON.stringify(activeOrder));
+    setCachedOrder(activeOrder);
+  }, [activeOrder, user?.id]);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  const readPendingStatusQueue = (): QueuedStatusUpdate[] => {
+    if (!user?.id) return [];
+    const raw = window.localStorage.getItem(getPendingStatusQueueKey(user.id));
+    if (!raw) return [];
+    try {
+      return JSON.parse(raw) as QueuedStatusUpdate[];
+    } catch {
+      window.localStorage.removeItem(getPendingStatusQueueKey(user.id));
+      return [];
+    }
+  };
+
+  const writePendingStatusQueue = (queue: QueuedStatusUpdate[]) => {
+    if (!user?.id) return;
+    window.localStorage.setItem(getPendingStatusQueueKey(user.id), JSON.stringify(queue));
+  };
+
+  useEffect(() => {
+    if (!isOnline || !user?.id) return;
+
+    const syncPendingUpdates = async () => {
+      const queue = readPendingStatusQueue();
+      if (!queue.length) return;
+
+      const remaining: QueuedStatusUpdate[] = [];
+      for (const update of queue) {
+        const { data, error } = await updateOrderStatus(update.orderId, update.targetStatus, {
+          riderId: update.riderId,
+          note: 'Synced after rider came back online.',
+        });
+
+        if (error || !data) {
+          remaining.push(update);
+          continue;
+        }
+
+        if (update.targetStatus === 'delivered' && update.proofImageUrl) {
+          await createDeliveryPhoto({
+            orderId: update.orderId,
+            riderId: update.riderId,
+            imageUrl: update.proofImageUrl,
+          });
+        }
+
+        queryClient.setQueryData<Order[]>(
+          queryKeys.ordersForUser(user.id, 'rider'),
+          (current = []) => current.map((order) => (order.id === data.id ? data : order)),
+        );
+      }
+
+      writePendingStatusQueue(remaining);
+      if (remaining.length !== queue.length) {
+        void riderOrdersQuery.refetch();
+        showToast('Offline updates synced', 'Queued rider status updates were sent to Bloom Shop.');
+      }
+    };
+
+    void syncPendingUpdates();
+  }, [isOnline, user?.id]);
 
   useRealtimeQueryInvalidation(
     [
@@ -262,14 +395,78 @@ export function ActiveDelivery() {
     }
   };
 
+  const queueStatusUpdate = async (targetStatus: Order['status'], proofImageUrl?: string | null) => {
+    if (!activeOrder || !user?.id) return;
+
+    writePendingStatusQueue([
+      ...readPendingStatusQueue(),
+      {
+        orderId: activeOrder.id,
+        riderId: user.id,
+        targetStatus,
+        proofImageUrl: proofImageUrl ?? null,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    showToast('Saved offline', `Order #${activeOrder.id.slice(0, 8)} will sync when your signal returns.`);
+  };
+
   const updateStep = async (targetStatus: Order['status']) => {
     if (!activeOrder || !nextStatus || !user?.id || targetStatus !== nextStatus) return;
 
+    let proofImageUrl: string | null = null;
+    if (targetStatus === 'delivered') {
+      if (!proofFile) {
+        showToast('Proof photo required', 'Upload a photo of the delivered bouquet before closing the route.');
+        return;
+      }
+      proofImageUrl = proofPreview;
+      if (!proofImageUrl && !isOnline) {
+        showToast('Photo unavailable', 'Select the proof photo again before saving this offline.');
+        return;
+      }
+    }
+
+    if (!isOnline) {
+      await queueStatusUpdate(targetStatus, proofImageUrl);
+      return;
+    }
+
+    setDelivering(targetStatus === 'delivered');
+    if (targetStatus === 'delivered' && proofFile) {
+      const upload = await uploadDeliveryProofImage(proofFile, activeOrder.id);
+      if (upload.error || !upload.data) {
+        setDelivering(false);
+        const proceedWithoutPhoto = window.confirm(
+          `Photo upload failed: ${upload.error ?? 'Unable to upload the proof photo.'}\n\nDo you want to mark this order as delivered without a photo?`,
+        );
+        if (!proceedWithoutPhoto) {
+          return;
+        }
+        proofImageUrl = null;
+      } else {
+        proofImageUrl = upload.data;
+      }
+    }
+
     const { data, error } = await updateOrderStatus(activeOrder.id, targetStatus, { riderId: user.id });
+    setDelivering(false);
 
     if (error || !data) {
       showToast('Update failed', error ?? 'Unable to update the delivery status.');
       return;
+    }
+
+    if (targetStatus === 'delivered' && proofImageUrl) {
+      const photo = await createDeliveryPhoto({
+        orderId: activeOrder.id,
+        riderId: user.id,
+        imageUrl: proofImageUrl,
+      });
+
+      if (photo.error) {
+        showToast('Proof saved later', photo.error);
+      }
     }
 
     queryClient.setQueryData<Order[]>(
@@ -280,27 +477,88 @@ export function ActiveDelivery() {
     showToast('Delivery updated', `Order #${data.id.slice(0, 8)} is now ${STATUS_LABELS[data.status]}.`);
   };
 
+  const handleProofFileChange = (file?: File | null) => {
+    setProofFile(file ?? null);
+    if (!file) {
+      setProofPreview(null);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.addEventListener('load', () => {
+      if (typeof reader.result === 'string') {
+        setProofPreview(reader.result);
+      }
+    });
+    reader.readAsDataURL(file);
+  };
+
+  const copyAddress = async () => {
+    if (!displayOrder?.delivery_address) return;
+    try {
+      await navigator.clipboard.writeText(displayOrder.delivery_address);
+      showToast('Address copied', 'Delivery address is ready to paste into maps or messages.');
+    } catch {
+      showToast('Copy unavailable', 'Select and copy the address manually from the customer details card.');
+    }
+  };
+
+  const submitIssueReport = async () => {
+    if (!activeOrder || !user?.id) return;
+
+    const { data, error } = await reportDeliveryIssue({
+      orderId: activeOrder.id,
+      riderId: user.id,
+      reason: issueReason,
+      notes: issueNotes,
+    });
+
+    if (error || !data) {
+      showToast('Issue not sent', error ?? 'Unable to report this delivery issue.');
+      return;
+    }
+
+    setIssueModalOpen(false);
+    setIssueNotes('');
+    setIssueReason('wrong_address');
+    showToast('Issue reported', 'Admin has been notified about this delivery.');
+  };
+
   return (
     <PageWrapper>
       <div className="page-shell">
         <div className="dashboard-layout">
           <Sidebar role="rider" />
           {loading ? (
-            <Card className="summary-card">Loading your active delivery...</Card>
+            <Card className="summary-card">
+              <Skeleton style={{ minHeight: '10rem' }} />
+              <div className="rider-status-grid" style={{ marginTop: '1rem' }}>
+                <Skeleton style={{ minHeight: '6rem' }} />
+                <Skeleton style={{ minHeight: '6rem' }} />
+                <Skeleton style={{ minHeight: '6rem' }} />
+                <Skeleton style={{ minHeight: '6rem' }} />
+              </div>
+            </Card>
           ) : null}
-          {activeOrder ? (
+          {displayOrder ? (
             <Card className="summary-card" style={{ minHeight: '28rem' }}>
               <div className="section" style={{ gap: '0.5rem' }}>
                 <span className="eyebrow">Active Delivery</span>
-                <h2>{STATUS_LABELS[activeOrder.status]}</h2>
-                <p>{activeOrder.delivery_address}</p>
-                <p>{activeOrder.notes}</p>
+                <h2>{STATUS_LABELS[displayOrder.status]}</h2>
+                <p>{displayOrder.delivery_address}</p>
+                <p>{displayOrder.notes}</p>
               </div>
               <div className="summary-row">
-                <span>{activeOrder.items?.length ?? 0} bouquet item(s)</span>
-                <span className="badge badge-success">{activeOrder.status}</span>
+                <span>{displayOrder.items?.length ?? 0} bouquet item(s)</span>
+                <span className="badge badge-success">{displayOrder.status}</span>
               </div>
-              {activeOrder.status === 'pending' ? (
+              {!isOnline ? (
+                <Card className="glass-card" style={{ padding: '1rem' }}>
+                  <strong>Offline mode</strong>
+                  <p>Address, phone, and delivery notes are cached. Status updates will sync when you are online.</p>
+                </Card>
+              ) : null}
+              {displayOrder.status === 'pending' ? (
                 <Card className="glass-card" style={{ padding: '1rem' }}>
                   <p>
                     This order is assigned to you and still waiting for cashier/admin release before pickup. You can
@@ -310,10 +568,44 @@ export function ActiveDelivery() {
               ) : null}
 
               <Card className="glass-card" style={{ padding: '1rem' }}>
+                <div className="section" style={{ gap: '0.5rem' }}>
+                  <strong>Customer Details</strong>
+                  <div className="summary-list">
+                    <div className="summary-row">
+                      <span>Customer</span>
+                      <strong>{displayOrder.customer?.full_name ?? 'Bloom customer'}</strong>
+                    </div>
+                    <div className="summary-row">
+                      <span>Phone</span>
+                      {displayOrder.customer?.phone ? (
+                        <a href={`tel:${displayOrder.customer.phone}`}>{displayOrder.customer.phone}</a>
+                      ) : (
+                        <strong>Not provided</strong>
+                      )}
+                    </div>
+                    <div className="summary-row" style={{ alignItems: 'flex-start' }}>
+                      <span>Address</span>
+                      <strong>{displayOrder.delivery_address || 'TBD'}</strong>
+                    </div>
+                    <div className="summary-row" style={{ alignItems: 'flex-start' }}>
+                      <span>Notes</span>
+                      <strong>{displayOrder.notes || 'No delivery notes'}</strong>
+                    </div>
+                  </div>
+                  <div className="action-row action-row-dual">
+                    <Button variant="secondary" onClick={copyAddress}>Copy Address</Button>
+                    <Button variant="secondary" disabled={!activeOrder} onClick={() => setIssueModalOpen(true)}>
+                      Report Issue
+                    </Button>
+                  </div>
+                </div>
+              </Card>
+
+              <Card className="glass-card" style={{ padding: '1rem' }}>
                 <div className="section" style={{ gap: '0.35rem' }}>
                   <strong>Delivery Workflow</strong>
                   <p>
-                    {activeOrder.status === 'pending'
+                    {displayOrder.status === 'pending'
                       ? 'Cashier or admin still needs to release this order. Once released, the next highlighted card becomes your action.'
                       : nextStatus
                         ? `Tap the highlighted step when you reach ${STATUS_LABELS[nextStatus]}.`
@@ -324,7 +616,7 @@ export function ActiveDelivery() {
                 <div className="rider-status-grid" style={{ marginTop: '1rem' }}>
                   {riderWorkflowSteps.map((step, index) => {
                     const isCurrent = index === workflowStage;
-                    const isComplete = index < workflowStage || (index === 0 && activeOrder.status !== 'pending');
+                    const isComplete = index < workflowStage || (index === 0 && displayOrder.status !== 'pending');
                     const isNextAction = step.actionStatus === nextStatus;
 
                     return (
@@ -365,16 +657,23 @@ export function ActiveDelivery() {
 
                         <div className="rider-status-actions">
                           {isNextAction ? (
-                            <Button size="sm" onClick={() => void updateStep(step.actionStatus!)} fullWidth>
+                            <Button
+                              size="sm"
+                              onClick={() => void updateStep(step.actionStatus!)}
+                              disabled={delivering}
+                              fullWidth
+                            >
                               {step.actionStatus === 'picked_up'
                                 ? 'Mark as Picked Up'
                                 : step.actionStatus === 'on_the_way'
                                   ? 'Mark as On The Way'
-                                  : 'Mark as Delivered'}
+                                  : delivering
+                                    ? 'Uploading Proof...'
+                                    : 'Mark as Delivered'}
                             </Button>
                           ) : isCurrent ? (
                             <span className="muted">
-                              {activeOrder.status === 'pending' && step.key === 'assigned'
+                              {displayOrder.status === 'pending' && step.key === 'assigned'
                                 ? 'Waiting for release'
                                 : 'Current stage'}
                             </span>
@@ -388,15 +687,36 @@ export function ActiveDelivery() {
                     );
                   })}
                 </div>
+                {nextStatus === 'delivered' ? (
+                  <Card className="glass-card" style={{ marginTop: '1rem', padding: '1rem' }}>
+                    <div className="section" style={{ gap: '0.5rem' }}>
+                      <strong>Proof of Delivery</strong>
+                      <p>Upload a clear photo of the delivered bouquet before closing this route.</p>
+                      <input
+                        aria-label="Proof of delivery photo"
+                        accept="image/*"
+                        type="file"
+                        onChange={(event) => handleProofFileChange(event.target.files?.[0])}
+                      />
+                      {proofPreview ? (
+                        <img
+                          src={proofPreview}
+                          alt="Proof of delivered bouquet preview"
+                          style={{ borderRadius: '0.5rem', maxHeight: '14rem', objectFit: 'cover', width: '100%' }}
+                        />
+                      ) : null}
+                    </div>
+                  </Card>
+                ) : null}
               </Card>
 
               <TrackingMap
-                orderId={activeOrder.id}
+                orderId={displayOrder.id}
                 rider={profile}
-                customer={activeOrder.customer}
-                deliveryAddress={activeOrder.delivery_address}
+                customer={displayOrder.customer}
+                deliveryAddress={displayOrder.delivery_address}
                 eta={eta}
-                orderStatus={activeOrder.status}
+                orderStatus={displayOrder.status}
                 trackingPoints={trackingPoints}
                 variant="rider"
               />
@@ -418,12 +738,12 @@ export function ActiveDelivery() {
                 <div className="action-row action-row-dual" style={{ marginTop: '1rem' }}>
                   <Button
                     variant="secondary"
-                    onClick={() => void sendPreviewUpdate(activeOrder.status, 'Manual preview route update')}
-                    disabled={sendingPreview || sharingLocation || !canShareLocation}
+                    onClick={() => void sendPreviewUpdate(displayOrder.status, 'Manual preview route update')}
+                    disabled={sendingPreview || sharingLocation || !canShareLocation || !isOnline}
                   >
                     {sendingPreview ? 'Sending Preview...' : 'Send Preview Update'}
                   </Button>
-                  <Button onClick={shareCurrentLocation} disabled={sharingLocation || sendingPreview || !canShareLocation}>
+                  <Button onClick={shareCurrentLocation} disabled={sharingLocation || sendingPreview || !canShareLocation || !isOnline}>
                     {sharingLocation ? 'Sharing GPS...' : 'Use Current Location'}
                   </Button>
                 </div>
@@ -437,6 +757,32 @@ export function ActiveDelivery() {
           ) : null}
         </div>
       </div>
+      <Modal
+        open={issueModalOpen}
+        onClose={() => setIssueModalOpen(false)}
+        title="Report Delivery Issue"
+        description="Send admin a delivery exception with the route context attached."
+      >
+        <div className="section">
+          <div className="select-shell">
+            <select value={issueReason} onChange={(event) => setIssueReason(event.target.value as DeliveryIssueReason)}>
+              {issueOptions.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </div>
+          <Textarea
+            label="Optional notes"
+            value={issueNotes}
+            onChange={(event) => setIssueNotes(event.target.value)}
+            placeholder="Add context for admin..."
+          />
+          <div className="summary-row">
+            <Button variant="secondary" onClick={() => setIssueModalOpen(false)}>Close</Button>
+            <Button onClick={submitIssueReport}>Send Report</Button>
+          </div>
+        </div>
+      </Modal>
     </PageWrapper>
   );
 }

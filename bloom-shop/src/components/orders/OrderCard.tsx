@@ -41,6 +41,16 @@ export function OrderCard({ order }: OrderCardProps) {
         </div>
         <strong className="price">{formatPrice(order.total_amount)}</strong>
       </div>
+      {order.delivery_photos?.[0] ? (
+        <div className="section" style={{ gap: '0.35rem' }}>
+          <strong>Proof of delivery</strong>
+          <img
+            src={order.delivery_photos[0].image_url}
+            alt={`Delivered bouquet for order ${order.id.slice(0, 8)}`}
+            style={{ borderRadius: '0.5rem', maxHeight: '14rem', objectFit: 'cover', width: '100%' }}
+          />
+        </div>
+      ) : null}
       <Link to={`/customer/orders/${order.id}`}>
         <Button variant="secondary">
           View Details

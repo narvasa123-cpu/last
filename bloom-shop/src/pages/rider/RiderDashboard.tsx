@@ -7,6 +7,7 @@ import { Sidebar } from '../../components/layout/Sidebar';
 import { PageWrapper } from '../../components/layout/PageWrapper';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { useAuth } from '../../hooks/useAuth';
 import { useAvailableDeliveriesQuery, useOrdersForUserQuery } from '../../hooks/useAppQueries';
 import { useNotifications } from '../../hooks/useNotifications';
@@ -16,6 +17,11 @@ import { assignOrderToRider } from '../../lib/orders';
 import { queryKeys } from '../../lib/queryClient';
 import type { Order } from '../../lib/types';
 import { formatDateTime } from '../../lib/utils';
+
+function estimateMockDistance(order: Order, index: number): number {
+  const seed = Array.from(order.id).reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return Number((1.8 + ((seed + index) % 7) * 0.6).toFixed(1));
+}
 
 export function RiderDashboard() {
   const { user } = useAuth();
@@ -29,6 +35,13 @@ export function RiderDashboard() {
   const activeAssignedOrders = useMemo(
     () => assignedOrders.filter((order) => !['delivered', 'cancelled'].includes(order.status)),
     [assignedOrders],
+  );
+  const availableRoutes = useMemo(
+    () =>
+      availableDeliveries
+        .map((order, index) => ({ order, distance: estimateMockDistance(order, index) }))
+        .sort((left, right) => left.distance - right.distance),
+    [availableDeliveries],
   );
 
   useRealtimeQueryInvalidation(
@@ -111,7 +124,10 @@ export function RiderDashboard() {
               </div>
               <div className="history-list">
                 {loading ? (
-                  <Card className="delivery-card">Loading assigned deliveries...</Card>
+                  <>
+                    <Skeleton style={{ minHeight: '8rem' }} />
+                    <Skeleton style={{ minHeight: '8rem' }} />
+                  </>
                 ) : activeAssignedOrders.length ? (
                   activeAssignedOrders.map((order) => (
                     <Card className="delivery-card" key={order.id}>
@@ -148,6 +164,36 @@ export function RiderDashboard() {
             <Card className="summary-card">
               <div className="section-heading">
                 <div className="section">
+                  <span className="eyebrow">My Day</span>
+                  <h2>Assigned route checklist</h2>
+                  <p>All drops assigned to you, ordered by the current delivery stage.</p>
+                </div>
+              </div>
+              <div className="history-list">
+                {loading ? (
+                  <Skeleton style={{ minHeight: '8rem' }} />
+                ) : activeAssignedOrders.length ? (
+                  activeAssignedOrders.map((order) => (
+                    <label className="delivery-card" key={`day-${order.id}`} style={{ display: 'block' }}>
+                      <div className="summary-row">
+                        <div className="info-row" style={{ justifyContent: 'flex-start' }}>
+                          <input type="checkbox" checked={order.status === 'delivered'} readOnly />
+                          <strong>Order #{order.id.slice(0, 8)}</strong>
+                        </div>
+                        <span className="badge badge-primary">{STATUS_LABELS[order.status]}</span>
+                      </div>
+                      <p>{order.delivery_address}</p>
+                    </label>
+                  ))
+                ) : (
+                  <Card className="delivery-card">Your delivery checklist is clear.</Card>
+                )}
+              </div>
+            </Card>
+
+            <Card className="summary-card">
+              <div className="section-heading">
+                <div className="section">
                   <span className="eyebrow">Available Deliveries</span>
                   <h2>Nearby bouquet drops</h2>
                   <p>Accept the next route based on proximity and item count.</p>
@@ -155,17 +201,21 @@ export function RiderDashboard() {
               </div>
               <div className="history-list">
                 {loading ? (
-                  <Card className="delivery-card">Loading deliveries...</Card>
-                ) : availableDeliveries.length ? (
-                  availableDeliveries.map((order, index) => (
+                  <>
+                    <Skeleton style={{ minHeight: '8rem' }} />
+                    <Skeleton style={{ minHeight: '8rem' }} />
+                  </>
+                ) : availableRoutes.length ? (
+                  availableRoutes.map(({ order, distance }) => (
                     <Card className="delivery-card" key={order.id}>
                       <div className="summary-row">
                         <div className="section" style={{ gap: '0.2rem' }}>
                           <strong>Order #{order.id.slice(0, 8)}</strong>
                           <p>{order.delivery_address}</p>
                         </div>
-                        <span className="badge badge-primary">{1.8 + index * 0.9} km away</span>
+                        <span className="badge badge-primary">{distance} km estimated</span>
                       </div>
+                      <p className="muted">Sorted by nearest estimated drop-off distance.</p>
                       <div className="summary-row">
                         <span>{order.items?.length ?? 0} item(s)</span>
                         <div className="summary-row">

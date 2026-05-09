@@ -1,4 +1,5 @@
 import { Minus, Plus, Trash2 } from 'lucide-react';
+import { Link } from 'react-router-dom';
 
 import type { CartLine } from '../../lib/types';
 import { formatPrice } from '../../lib/utils';
@@ -32,6 +33,15 @@ export function CartItem({ line, onDecrease, onIncrease, onRemove }: CartItemPro
             </Button>
           </div>
           <p className="line-clamp-2">{line.product.description}</p>
+          {line.product.custom_bouquet ? (
+            <Link
+              className="rose"
+              to={`/custom-bouquet?design=${line.product.custom_bouquet.id}`}
+              style={{ fontWeight: 700 }}
+            >
+              Edit this design in the bouquet builder
+            </Link>
+          ) : null}
         </div>
         <div className="summary-row">
           <div className="quantity-stepper">

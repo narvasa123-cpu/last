@@ -1,5 +1,6 @@
 import { X } from 'lucide-react';
 import { useEffect, type PropsWithChildren } from 'react';
+import { createPortal } from 'react-dom';
 
 import { cn } from '../../lib/utils';
 import { Button } from './Button';
@@ -36,7 +37,7 @@ export function Modal({
 
   if (!open) return null;
 
-  return (
+  return createPortal(
     <div className="modal-overlay" onClick={onClose} role="presentation">
       <Card
         className={cn('modal-panel', className)}
@@ -56,6 +57,7 @@ export function Modal({
         </div>
         {children}
       </Card>
-    </div>
+    </div>,
+    document.body,
   );
 }
